@@ -4,6 +4,7 @@ from streamlit_gsheets import GSheetsConnection
 import datetime
 import calendar
 import jpholiday
+import re
 
 # --- 1. ページ設定 ---
 st.set_page_config(page_title="店舗記録ログ", layout="centered")
@@ -47,9 +48,11 @@ st.markdown("""
     /* ヘッダー類 */
     .store-header { font-size: 24px; font-weight: bold; color: #fff; border-bottom: 2px solid #4da6ff; padding-bottom: 10px; margin-bottom: 20px; }
     .section-title { font-size: 14px; font-weight: bold; color: #666; margin-top: 40px; margin-bottom: 5px; border-bottom: 1px solid #333; padding-bottom: 2px; }
-    .visit-row { border-bottom: 1px solid #333; padding: 12px 0; color: #ccc; }
-    .visit-date { font-size: 14px; font-weight: bold; color: #8ab4f8; display: inline-block; width: 110px; }
-    .visit-info { font-size: 13px; color: #bbb; display: inline-block; }
+    
+    /* 訪問履歴行 (CSS修正: 行全体の下線のみ残し、内部レイアウトはColumnに任せる) */
+    .visit-row-container { border-bottom: 1px solid #333; padding: 12px 0; }
+    .visit-date { font-size: 14px; font-weight: bold; color: #8ab4f8; display: inline-block; margin-bottom: 4px; }
+    
     .cal-header { text-align: center; font-weight: bold; font-size: 12px; margin-bottom: 5px; color: #aaa; }
 
     /* フォーム */
@@ -68,9 +71,9 @@ st.markdown("""
     }
     div[data-testid="stButton"] button[kind="secondary"] {
          background-color: #262730 !important; color: #e0e0e0 !important; border: 1px solid #555 !important;
+         width: 100%;
     }
     
-    /* スクロールコンテナの枠線を消す */
     [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"] { border: none; }
     </style>
 """, unsafe_allow_html=True)
@@ -78,9 +81,7 @@ st.markdown("""
 # --- 3. データベース接続 ---
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# --- 4. 関数定義 (すべて先に定義) ---
-
-# キャッシュ付きデータ取得
+# --- データ操作 ---
 @st.cache_data(ttl=60)
 def get_visits_data():
     try:
@@ -89,7 +90,7 @@ def get_visits_data():
         df['id'] = pd.to_numeric(df['id'], errors='coerce').fillna(0).astype(int)
         return df
     except:
-        return pd.DataFrame(columns=['id', 'store_name', 'visit_date', 'visit_time', 'members', 'count_area', 'notices', 'memo'])
+        return pd.DataFrame(columns=['id', 'store_name', 'visit_date', 'visit_time', 'members', 'sv_members', 'count_area', 'notices', 'memo', 'record_memo'])
 
 @st.cache_data(ttl=60)
 def get_stores_data():
@@ -113,14 +114,13 @@ def clear_all_cache():
     get_stores_data.clear()
     get_employees_list.clear()
 
-# データ更新
 def add_visit_data(data):
     try:
         df = conn.read(worksheet="visits", ttl=0)
         df = df.fillna("")
         df['id'] = pd.to_numeric(df['id'], errors='coerce').fillna(0).astype(int)
     except:
-        df = pd.DataFrame(columns=['id', 'store_name', 'visit_date', 'visit_time', 'members', 'count_area', 'notices', 'memo'])
+        df = pd.DataFrame(columns=['id', 'store_name', 'visit_date', 'visit_time', 'members', 'sv_members', 'count_area', 'notices', 'memo', 'record_memo'])
 
     new_id = df['id'].max() + 1 if not df.empty and 'id' in df.columns else 1
     data['id'] = new_id
@@ -129,6 +129,21 @@ def add_visit_data(data):
     updated_df = pd.concat([df, new_row], ignore_index=True)
     conn.update(worksheet="visits", data=updated_df)
     clear_all_cache()
+
+def update_visit_data(record_id, updated_data):
+    with st.spinner("更新中..."):
+        try:
+            df = conn.read(worksheet="visits", ttl=0)
+            df = df.fillna("")
+            df['id'] = pd.to_numeric(df['id'], errors='coerce').fillna(0).astype(int)
+            
+            if not df.empty and record_id in df['id'].values:
+                idx = df.index[df['id'] == record_id][0]
+                for key, value in updated_data.items():
+                    df.at[idx, key] = value
+                conn.update(worksheet="visits", data=df)
+                clear_all_cache()
+        except: pass
 
 def delete_visit_data(record_id):
     with st.spinner("削除中..."):
@@ -184,29 +199,24 @@ def check_and_add_employees(names_list):
         return len(news)
     return 0
 
-def sync_stores_from_visits():
-    try:
-        stores_df = conn.read(worksheet="stores", ttl=0)
-        if not stores_df.empty: return
-    except: pass
+# --- 4. セッション管理 ---
+if 'selected_store' not in st.session_state:
+    st.session_state.selected_store = None
+if 'cal_view_mode' not in st.session_state:
+    st.session_state.cal_view_mode = 'month'
+if 'cal_selected_date' not in st.session_state:
+    st.session_state.cal_selected_date = datetime.date.today()
+if 'cal_year' not in st.session_state:
+    st.session_state.cal_year = datetime.date.today().year
+if 'cal_month' not in st.session_state:
+    st.session_state.cal_month = datetime.date.today().month
+if 'edit_record_id' not in st.session_state:
+    st.session_state.edit_record_id = None
 
-    try:
-        visits_df = conn.read(worksheet="visits", ttl=0)
-        if visits_df.empty: return
-        visited = visits_df['store_name'].unique().tolist()
-        new_stores = []
-        for s in visited:
-            l = visits_df[visits_df['store_name'] == s].iloc[-1]
-            new_stores.append({"store_name": s, "notices": l.get('notices', ''), "memo": l.get('memo', '')})
-        if new_stores:
-            conn.update(worksheet="stores", data=pd.DataFrame(new_stores))
-            clear_all_cache()
-    except: pass
+if 'search_add_mode' not in st.session_state:
+    st.session_state.search_add_mode = False
 
-# --- UIコンポーネント関数 ---
-
-def navigate_to(mode, store_name=None):
-    st.session_state.page_mode = mode
+def navigate_to(store_name=None):
     if store_name: st.session_state.selected_store = store_name
 
 def change_cal_month(amount):
@@ -217,14 +227,18 @@ def change_cal_month(amount):
     st.session_state.cal_month = m
     st.session_state.cal_year = y
 
-def member_selector(label, key_suffix):
+# --- 5. UIコンポーネント ---
+def member_selector(label, key_suffix, default_vals=None):
     st.markdown(f"<label style='font-size:14px; color:#bbb;'>{label}</label>", unsafe_allow_html=True)
     employees = get_employees_list()
-    selected = st.multiselect("メンバーを選択", options=employees, placeholder="名前を検索...", label_visibility="collapsed", key=f"ms_{key_suffix}")
     
-    st.caption("リストにない人は↓に入力 (改行区切りで複数可)。保存時に自動追加されます。")
-    new_members_text = st.text_area("新規メンバー", placeholder="例:\n佐藤\n高橋", label_visibility="collapsed", height=80, key=f"new_{key_suffix}")
-    
+    def_selected = []
+    if default_vals:
+        def_selected = [n.strip() for n in default_vals.split(',') if n.strip() in employees]
+
+    selected = st.multiselect("メンバーを選択", options=employees, default=def_selected, placeholder="名前を検索...", label_visibility="collapsed", key=f"ms_{key_suffix}")
+    st.caption("リストにない人は↓に入力 (改行区切り)。保存時に自動追加されます。")
+    new_members_text = st.text_area("新規追加", placeholder="例:\n佐藤\n高橋", label_visibility="collapsed", height=60, key=f"new_{key_suffix}")
     return selected, new_members_text
 
 def render_add_visit_screen(store, back_callback, mode_prefix="default"):
@@ -238,25 +252,36 @@ def render_add_visit_screen(store, back_callback, mode_prefix="default"):
     c_d, _ = st.columns([0.5, 0.5])
     new_date = c_d.date_input("日付", value=None, key=f"date_add_{mode_prefix}")
     
-    sel_mems, txt_mems = member_selector("人数 / メンバー", f"mem_{mode_prefix}")
+    sel_sv, txt_sv = member_selector("SV", f"sv_{mode_prefix}")
+    st.write("")
+    sel_mems, txt_mems = member_selector("メンバー", f"mem_{mode_prefix}")
     
-    # 担当場所 (st.formなし、通常の入力)
-    st.markdown("<label style='font-size:14px; color:#bbb;'>担当場所</label>", unsafe_allow_html=True)
-    new_area = st.text_input("担当場所", placeholder="例: 1Fフロア", label_visibility="collapsed", key=f"area_{mode_prefix}")
+    st.markdown("<label style='font-size:14px; color:#bbb;'>アサイン</label>", unsafe_allow_html=True)
+    new_area = st.text_input("アサイン", placeholder="例: 1Fフロア", label_visibility="collapsed", key=f"area_{mode_prefix}")
+    
+    st.markdown("<label style='font-size:14px; color:#bbb;'>記録メモ</label>", unsafe_allow_html=True)
+    new_rec_memo = st.text_area("記録メモ", placeholder="その日の特記事項など", label_visibility="collapsed", height=80, key=f"rec_memo_{mode_prefix}")
     
     st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
     
-    # 通常ボタンで保存アクション
     if st.button("保存して戻る", type="primary", key=f"save_btn_{mode_prefix}", use_container_width=True):
         with st.spinner("保存処理中..."):
             d_str = new_date.strftime("%Y-%m-%d") if new_date else ""
-            m_list = [n.strip() for n in txt_mems.splitlines() if n.strip()]
-            final_list = list(set(sel_mems + m_list))
-            check_and_add_employees(m_list)
+            
+            sv_manual = [n.strip() for n in txt_sv.splitlines() if n.strip()]
+            final_sv = list(set(sel_sv + sv_manual))
+            check_and_add_employees(sv_manual)
+            
+            mem_manual = [n.strip() for n in txt_mems.splitlines() if n.strip()]
+            final_mem = list(set(sel_mems + mem_manual))
+            check_and_add_employees(mem_manual)
             
             new_data = {
                 "store_name": store, "visit_date": d_str, "visit_time": "",
-                "members": ", ".join(final_list), "count_area": new_area,
+                "sv_members": ", ".join(final_sv),
+                "members": ", ".join(final_mem), 
+                "count_area": new_area,
+                "record_memo": new_rec_memo,
                 "notices": "", "memo": "" 
             }
             add_visit_data(new_data)
@@ -264,7 +289,73 @@ def render_add_visit_screen(store, back_callback, mode_prefix="default"):
             back_callback()
             st.rerun()
 
+def render_edit_visit_screen(record_id, store, back_callback, mode_prefix="edit"):
+    df = get_visits_data()
+    record = df[df['id'] == record_id].iloc[0]
+    
+    c1, c2 = st.columns([0.3, 0.7])
+    if c1.button("◀ キャンセル", type="secondary", key=f"cncl_edit_{mode_prefix}"):
+        back_callback()
+    
+    st.markdown(f'<div class="store-header">記録の編集</div>', unsafe_allow_html=True)
+    st.caption(f"店舗: {store}")
+
+    init_date = None
+    if record['visit_date']:
+        try: init_date = datetime.datetime.strptime(record['visit_date'], "%Y-%m-%d").date()
+        except: pass
+
+    c_d, _ = st.columns([0.5, 0.5])
+    new_date = c_d.date_input("日付", value=init_date, key=f"date_edit_{mode_prefix}_{record_id}")
+    
+    init_sv = record.get('sv_members', '')
+    init_mem = record.get('members', '')
+    
+    sel_sv, txt_sv = member_selector("SV", f"sv_edit_{mode_prefix}_{record_id}", default_vals=init_sv)
+    st.write("")
+    sel_mems, txt_mems = member_selector("メンバー", f"mem_edit_{mode_prefix}_{record_id}", default_vals=init_mem)
+    
+    st.markdown("<label style='font-size:14px; color:#bbb;'>アサイン</label>", unsafe_allow_html=True)
+    new_area = st.text_input("アサイン", value=record.get('count_area', ''), label_visibility="collapsed", key=f"area_edit_{mode_prefix}_{record_id}")
+    
+    st.markdown("<label style='font-size:14px; color:#bbb;'>記録メモ</label>", unsafe_allow_html=True)
+    new_rec_memo = st.text_area("記録メモ", value=record.get('record_memo', ''), label_visibility="collapsed", height=80, key=f"rec_memo_edit_{mode_prefix}_{record_id}")
+    
+    st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
+    
+    if st.button("更新して戻る", type="primary", key=f"upd_btn_{mode_prefix}_{record_id}", use_container_width=True):
+        with st.spinner("更新処理中..."):
+            d_str = new_date.strftime("%Y-%m-%d") if new_date else ""
+            
+            sv_manual = [n.strip() for n in txt_sv.splitlines() if n.strip()]
+            final_sv = list(set(sel_sv + sv_manual))
+            check_and_add_employees(sv_manual)
+            
+            mem_manual = [n.strip() for n in txt_mems.splitlines() if n.strip()]
+            final_mem = list(set(sel_mems + mem_manual))
+            check_and_add_employees(mem_manual)
+            
+            updated_data = {
+                "visit_date": d_str,
+                "sv_members": ", ".join(final_sv),
+                "members": ", ".join(final_mem),
+                "count_area": new_area,
+                "record_memo": new_rec_memo
+            }
+            update_visit_data(record_id, updated_data)
+            st.success("更新しました")
+            back_callback()
+            st.rerun()
+
 def render_store_detail_content(store, back_callback, add_callback, mode_prefix="default"):
+    # 編集モードチェック
+    if st.session_state.edit_record_id:
+        def close_edit():
+            st.session_state.edit_record_id = None
+            st.rerun()
+        render_edit_visit_screen(st.session_state.edit_record_id, store, close_edit, mode_prefix)
+        return
+
     c_back, _ = st.columns([0.25, 0.75])
     if c_back.button("◀ 戻る", type="secondary", key=f"back_{mode_prefix}"):
         back_callback()
@@ -283,21 +374,52 @@ def render_store_detail_content(store, back_callback, add_callback, mode_prefix=
         for _, row in store_visits.iterrows():
             date_disp = row['visit_date'] if row['visit_date'] else "日付なし"
             mem_disp = row['members'] if row['members'] else "-"
+            sv_disp = row.get('sv_members', '-')
+            if not sv_disp: sv_disp = "-"
             area_disp = row['count_area'] if row['count_area'] else "-"
+            rec_memo = row.get('record_memo', '')
             
-            c_info, c_del = st.columns([0.85, 0.15])
+            # 行コンテナ (CSSでborder-bottom適用)
+            st.markdown('<div class="visit-row-container">', unsafe_allow_html=True)
+            
+            # ★ レイアウト変更: 左(情報) | 中(メモ) | 右(ボタン)
+            c_info, c_memo, c_act = st.columns([0.4, 0.4, 0.2])
+            
             with c_info:
                 st.markdown(f"""
-                <div class="visit-row">
-                    <span class="visit-date">{date_disp}</span>
-                    <span class="visit-info">{mem_disp} / {area_disp}</span>
+                <div>
+                    <div class="visit-date">{date_disp}</div>
+                    <div style="font-size:12px; color:#ccc;">SV: {sv_disp} <br>Mem: {mem_disp}</div>
+                    <div style="font-size:12px; color:#aaa; margin-top:2px;">アサイン: {area_disp}</div>
                 </div>
                 """, unsafe_allow_html=True)
-            with c_del:
-                st.markdown('<div style="height: 10px;"></div>', unsafe_allow_html=True)
+            
+            with c_memo:
+                # メモ表示 (縦線で区切る)
+                if rec_memo:
+                    st.markdown(f"""
+                    <div style="font-size:12px; color:#eee; border-left:1px solid #444; padding-left:10px; height:100%; white-space: pre-wrap;">
+                        {rec_memo}
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div style="font-size:12px; color:#555; border-left:1px solid #444; padding-left:10px; height:100%;">
+                        (メモなし)
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            with c_act:
+                # ボタン配置
+                st.markdown('<div style="height: 0px;"></div>', unsafe_allow_html=True) # 上部調整
+                if st.button("詳細", key=f"edit_{mode_prefix}_{row['id']}", type="secondary"):
+                    st.session_state.edit_record_id = row['id']
+                    st.rerun()
                 if st.button("削除", key=f"del_{mode_prefix}_{row['id']}", type="secondary"):
                     delete_visit_data(row['id'])
                     st.rerun()
+            
+            st.markdown('</div>', unsafe_allow_html=True) # End visit-row-container
 
     st.write("")
     if st.button("新しい記録を追加", key=f"add_btn_{mode_prefix}", type="primary", use_container_width=True):
@@ -315,27 +437,6 @@ def render_store_detail_content(store, back_callback, add_callback, mode_prefix=
             update_store_info(store, new_notices, new_memo)
             st.success("更新しました")
             st.rerun()
-
-# --- 5. 初期化 (すべての関数定義の後) ---
-
-if 'sync_done' not in st.session_state:
-    sync_stores_from_visits()
-    st.session_state.sync_done = True
-
-if 'page_mode' not in st.session_state:
-    st.session_state.page_mode = 'list'
-if 'selected_store' not in st.session_state:
-    st.session_state.selected_store = None
-
-# カレンダー用
-if 'cal_view_mode' not in st.session_state:
-    st.session_state.cal_view_mode = 'month'
-if 'cal_selected_date' not in st.session_state:
-    st.session_state.cal_selected_date = datetime.date.today()
-if 'cal_year' not in st.session_state:
-    st.session_state.cal_year = datetime.date.today().year
-if 'cal_month' not in st.session_state:
-    st.session_state.cal_month = datetime.date.today().month
 
 
 # --- 6. メインUI ---
@@ -361,6 +462,7 @@ with tab_calendar:
     elif st.session_state.cal_view_mode == 'store' and st.session_state.selected_store:
         def back_to_day():
             st.session_state.cal_view_mode = 'day'
+            st.session_state.edit_record_id = None
             st.rerun()
         def go_to_add():
             st.session_state.cal_view_mode = 'add'
@@ -394,7 +496,7 @@ with tab_calendar:
                     <div class="day-card">
                         <div class="day-card-store">{s_name}</div>
                         <div class="day-card-info">メンバー: {mem}</div>
-                        <div class="day-card-info">場所: {area}</div>
+                        <div class="day-card-info">アサイン: {area}</div>
                     </div>
                     """, unsafe_allow_html=True)
                     
@@ -408,12 +510,20 @@ with tab_calendar:
         st.write("")
         c1, c2, c3 = st.columns([1, 3, 1])
         
+        def change_cal(delta):
+            m = st.session_state.cal_month + delta
+            y = st.session_state.cal_year
+            if m > 12: m=1; y+=1
+            elif m < 1: m=12; y-=1
+            st.session_state.cal_month = m
+            st.session_state.cal_year = y
+            
         if c1.button("◀", key="cal_prev", use_container_width=True):
-            change_cal_month(-1)
+            change_cal(-1)
             st.rerun()
         c2.markdown(f"<div style='text-align:center; font-weight:bold; padding-top:5px;'>{year}年 {month}月</div>", unsafe_allow_html=True)
         if c3.button("▶", key="cal_next", use_container_width=True):
-            change_cal_month(1)
+            change_cal(1)
             st.rerun()
             
         st.write("")
@@ -483,22 +593,22 @@ with tab_calendar:
 with tab_search:
     
     # --- 画面C: 訪問追加画面 ---
-    if st.session_state.page_mode == 'add' and st.session_state.selected_store:
-        def back_to_detail():
-            navigate_to('detail', st.session_state.selected_store)
+    if st.session_state.search_add_mode and st.session_state.selected_store:
+        def back_from_add():
+            st.session_state.search_add_mode = False
             st.rerun()
-        render_add_visit_screen(st.session_state.selected_store, back_to_detail, mode_prefix="search")
+        render_add_visit_screen(st.session_state.selected_store, back_from_add, mode_prefix="search")
 
     # --- 画面B: 店舗詳細画面 ---
-    elif st.session_state.page_mode == 'detail' and st.session_state.selected_store:
+    elif st.session_state.selected_store:
         def back_to_list():
             st.session_state.selected_store = None
-            navigate_to('list')
+            st.session_state.edit_record_id = None
             st.rerun()
-        def go_to_add():
-            navigate_to('add', st.session_state.selected_store)
+        def to_add():
+            st.session_state.search_add_mode = True
             st.rerun()
-        render_store_detail_content(st.session_state.selected_store, back_to_list, go_to_add, mode_prefix="search")
+        render_store_detail_content(st.session_state.selected_store, back_to_list, to_add, mode_prefix="search")
     
     # --- 画面A: 店舗一覧画面 ---
     else:
@@ -539,7 +649,6 @@ with tab_search:
             for s_name in filtered:
                 if st.button(f"{s_name}", key=f"btn_search_{s_name}", type="secondary", use_container_width=True):
                     st.session_state.selected_store = s_name
-                    navigate_to('detail', s_name)
                     st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -548,9 +657,10 @@ with tab_search:
 # ==========================================
 with tab_register:
     st.write("")
+    
     with st.form("new_store_form", clear_on_submit=True):
         st.subheader("新規店舗の登録")
-        st.caption("※ 訪問データは登録後の詳細画面から追加してください")
+        st.caption("※ 記録データは登録後の詳細画面から追加してください")
         
         store_name_in = st.text_input("店舗名 (必須)", placeholder="例: ○○店")
         st.markdown("---")
