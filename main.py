@@ -523,7 +523,7 @@ with tab_calendar:
             st.session_state.cal_view_mode = 'month'
             st.rerun()
             
-        st.markdown(f"### 📅 {d_str} の記録")
+        st.markdown(f"###  {d_str} の記録")
         
         visits_df = get_visits_data()
         day_visits = visits_df[visits_df['visit_date'] == d_str]
@@ -743,4 +743,5 @@ with tab_register:
                         register_new_store(store_name_in, notices_in, memo_in)
                         st.success(f"登録しました: {store_name_in}")
                         st.session_state.selected_store = store_name_in
+
                         st.rerun()
